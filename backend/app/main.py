@@ -9,6 +9,7 @@ and returns the cloned XAPK as an attachment download.
 """
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -66,13 +67,34 @@ TOOLS_DIR = Path(os.environ.get("TOOLS_DIR", "/tools"))
 _original_multipart_init = MultiPartParser.__init__
 
 
+# Discover at import time which cap-style kwargs the INSTALLED
+# ``MultiPartParser.__init__`` actually accepts. python-multipart 0.0.17 (the
+# version pinned in ``requirements.txt``) only exposes ``max_part_size``;
+# ``max_file_size`` arrived in a later release. Starlette wraps the parser
+# differently across versions too. Passing an unknown kwarg raises
+# ``TypeError`` inside Starlette's ``Request._get_form()`` and is translated
+# into the generic ``HTTPException(400, "There was an error parsing the body")``
+# we just saw, bypassing our handler entirely.
+try:
+    _mp_sig_params = set(
+        inspect.signature(_original_multipart_init).parameters.keys()
+    )
+    _mp_sig_params.discard("self")
+except (TypeError, ValueError):
+    # inspect.signature can fail on built-ins / C-impls; fall back to a safe
+    # minimal set that has been supported across every Starlette release we
+    # care about.
+    _mp_sig_params = {"max_part_size"}
+
+
 @wraps(_original_multipart_init)
 def _patched_multipart_init(self, headers, stream, *args, **kwargs):
-    # Starlette uses ``max_part_size``; python-multipart also exposes
-    # ``max_file_size``. We set both because the underlying class constants
-    # evolved across versions and we want the cap lifted either way.
-    kwargs.setdefault("max_part_size", MAX_UPLOAD_BYTES)
-    kwargs.setdefault("max_file_size", MAX_UPLOAD_BYTES)
+    # Only inject kwarg caps the underlying __init__ accepts. ``setdefault``
+    # keeps any caller-supplied value (e.g. unit tests) authoritative.
+    if "max_part_size" in _mp_sig_params:
+        kwargs.setdefault("max_part_size", MAX_UPLOAD_BYTES)
+    if "max_file_size" in _mp_sig_params:
+        kwargs.setdefault("max_file_size", MAX_UPLOAD_BYTES)
     return _original_multipart_init(self, headers, stream, *args, **kwargs)
 
 
