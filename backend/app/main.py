@@ -99,7 +99,10 @@ def create_app() -> FastAPI:
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
     TOOLS_DIR.mkdir(parents=True, exist_ok=True)
 
-    @app.get("/health")
+    # Accept both GET (humans / curl) and HEAD (wget --spider, docker healthcheck).
+    # In FastAPI / Starlette, HEAD on a route decorated with @api_route is served
+    # with the body stripped — exactly what healthcheck probes expect.
+    @app.api_route("/health", methods=["GET", "HEAD"])
     async def health() -> dict[str, str]:
         return {"status": "ok", "service": "xapk-cloner"}
 
