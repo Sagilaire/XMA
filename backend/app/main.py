@@ -195,15 +195,17 @@ def create_app() -> FastAPI:
             "debug_keystore_present": bool(paths.get("debug_keystore")),
             "tools_dir": str(TOOLS_DIR),
             "temp_dir": str(TEMP_DIR),
-        }        # Synchronous workdir cleanup that swallows exceptions (logged).
-        # Used both as a Starlette BackgroundTask after a successful response
-        # is fully streamed, and synchronously inside every except clause
-        # where no response object is yet available to attach a task to.
-        def _safe_cleanup_workdir(work_root: Path) -> None:
-            try:
-                cleanup(work_root)
-            except Exception:  # noqa: BLE001
-                logger.exception("Cleanup of work directory failed")
+        }
+
+    # Synchronous workdir cleanup that swallows exceptions (logged).
+    # Used both as a Starlette BackgroundTask after a successful response
+    # is fully streamed, and synchronously inside every except clause
+    # where no response object is yet available to attach a task to.
+    def _safe_cleanup_workdir(work_root: Path) -> None:
+        try:
+            cleanup(work_root)
+        except Exception:  # noqa: BLE001
+            logger.exception("Cleanup of work directory failed")
 
     @app.post("/upload")
     async def upload(
