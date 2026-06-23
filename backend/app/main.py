@@ -9,10 +9,12 @@ and returns the cloned XAPK as an attachment download.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
 import uuid
+from functools import wraps
 from pathlib import Path
 from typing import Optional
 
@@ -38,16 +40,103 @@ MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(3 * 1024 * 1024 * 
 TEMP_DIR = Path(os.environ.get("TEMP_DIR", "/temp/workflows"))
 TOOLS_DIR = Path(os.environ.get("TOOLS_DIR", "/tools"))
 
-# Starlette's MultiPartParser defaults to ``max_part_size = 1 MiB``. Real-world
-# XAPK files blow past that, so the parser raises during parameter resolution
-# (BEFORE the /upload handler body executes, OUTSIDE our try/except) and the
-# exception escapes to Starlette's default 500 response — a 21-byte
-# ``text/plain`` ``"Internal Server Error\\n"``. We lift the cap to
-# MAX_UPLOAD_BYTES at import time so the parser swallows anything under our
-# global ceiling. Anything over the ceiling is still rejected up-front by the
-# Content-Length guard inside the /upload handler before the parser even
-# runs.
-MultiPartParser.max_part_size = MAX_UPLOAD_BYTES
+
+# --- Multipart parser widening ------------------------------------------------------
+#
+# Symptom we are defending against (DevTools after a real upload):
+#   Status Code : 500 Internal Server Error
+#   content-length: 21         (- the literal bytes "Internal Server Error\n")
+#
+# That is Starlette's default exception page — an exception escaped the handler
+# stack. Investigation: Starlette's MultiPartParser.__init__ has the default
+# ``max_part_size: int = 1024 * 1024`` baked into the function signature; Python
+# evaluates default arguments at function-definition time, so reassigning the
+# class attribute (``MultiPartParser.max_part_size = X``) is a no-op for the
+# actual default value used when a caller omits the kwarg. Starlette's
+# ``Request._get_form()`` / multipart code path typically calls
+# ``MultiPartParser(headers, stream)`` WITHOUT passing max_part_size, so the
+# 1 MiB default kicks in for every >1 MiB file. The constraint is enforced
+# during FastAPI's parameter resolution, BEFORE our upload handler body runs,
+# which is why our ``except Exception`` never catches it.
+#
+# The robust cross-version fix is to wrap ``MultiPartParser.__init__`` and
+# inject our cap when callers omit it. ``setdefault`` keeps any caller-supplied
+# value (e.g. unit tests) authoritative.
+_original_multipart_init = MultiPartParser.__init__
+
+
+@wraps(_original_multipart_init)
+def _patched_multipart_init(self, headers, stream, *args, **kwargs):
+    # Starlette uses ``max_part_size``; python-multipart also exposes
+    # ``max_file_size``. We set both because the underlying class constants
+    # evolved across versions and we want the cap lifted either way.
+    kwargs.setdefault("max_part_size", MAX_UPLOAD_BYTES)
+    kwargs.setdefault("max_file_size", MAX_UPLOAD_BYTES)
+    return _original_multipart_init(self, headers, stream, *args, **kwargs)
+
+
+MultiPartParser.__init__ = _patched_multipart_init
+
+
+# --- Pure ASGI size guard ---------------------------------------------------------
+#
+# Even with the parser widened, we still want to short-circuit overly large
+# payloads BEFORE they ever reach FastAPI parameter resolution so the browser
+# gets a clean 413 instead of having the connection half-close mid-stream.
+# This class implements the ASGI 3.0 triple ``(scope, receive, send)`` so it
+# can be installed via ``app.add_middleware(_UploadSizeGuard, ...)``. Because
+# Starlette wraps middleware in the reverse of ``add_middleware`` order, we
+# register this AFTER CORS so it ends up as the outermost ran first on the
+# request path.
+class _UploadSizeGuard:
+    def __init__(self, app, max_bytes: int) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        if scope["method"] != "POST" or scope["path"] != "/upload":
+            await self.app(scope, receive, send)
+            return
+
+        cl_value: int = -1
+        for k, v in scope["headers"]:
+            if k == b"content-length":
+                try:
+                    cl_value = int(v.decode("ascii"))
+                except (UnicodeDecodeError, ValueError):
+                    cl_value = -1
+                break
+
+        if cl_value > self.max_bytes:
+            logger.warning(
+                "Rejecting oversize upload (ASGI guard): content_length=%d > max=%d",
+                cl_value,
+                self.max_bytes,
+            )
+            payload = json.dumps(
+                {
+                    "error": "upload_too_large",
+                    "max_bytes": self.max_bytes,
+                    "received": cl_value,
+                }
+            ).encode("utf-8")
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 413,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"content-length", str(len(payload)).encode()),
+                    ],
+                }
+            )
+            await send({"type": "http.response.body", "body": payload})
+            return
+
+        await self.app(scope, receive, send)
 
 
 # --- App factory --------------------------------------------------------------------
@@ -70,6 +159,10 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
         expose_headers=["Content-Disposition"],
     )
+
+    # Registered AFTER CORS so the size guard ends up as the outermost layer
+    # on the request path (Starlette wraps middleware in reverse-of-add order).
+    app.add_middleware(_UploadSizeGuard, max_bytes=MAX_UPLOAD_BYTES)
 
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
     TOOLS_DIR.mkdir(parents=True, exist_ok=True)
@@ -110,37 +203,12 @@ def create_app() -> FastAPI:
     ) -> Response:
         """Clone a XAPK file inside a workdir and return the result.
 
-        Important: we deliberately do NOT use Starlette's ``BaseHTTPMiddleware``
-        to enforce ``MAX_UPLOAD_BYTES`` because it forces a full-body read into
-        memory before the handler runs, breaking the multipart streaming flow
-        and dropping the connection mid-upload (the browser then reports
-        "Network error — could not reach the backend" as soon as the first
-        ``xhr.onerror`` fires). Instead we read the Content-Length header here,
-        before any File/Form parameter is materialised; the body bytes flow
-        straight from the socket into ``UploadFile.read`` chunks.
+        Note: the ``Content-Length`` rejection logic used to live here, but it
+        has moved to the ``_UploadSizeGuard`` ASGI middleware so the request
+        is rejected BEFORE Starlette's multipart parser is invoked. The
+        parser-widening ``__init__`` patch above means parts smaller than
+        ``MAX_UPLOAD_BYTES`` parse cleanly.
         """
-        cl_header = request.headers.get("content-length")
-        if cl_header and cl_header.isdigit() and int(cl_header) > MAX_UPLOAD_BYTES:
-            cl_value = int(cl_header)
-            logger.warning(
-                "Rejecting oversize upload: content_length=%d > max=%d", cl_value, MAX_UPLOAD_BYTES
-            )
-            # Return a flat-shape JSON response directly instead of raising
-            # HTTPException(detail=dict): the global exception_handler at the
-            # bottom of create_app wraps ``exc.detail`` into ``{"error": ...}``,
-            # which would produce ``{"error": {"error": ...}}`` — the SPA then
-            # renders ``[object Object]`` in its status banner. Returning
-            # JSONResponse keeps the shape the SPA's ``data.error`` lookup
-            # already understands.
-            return JSONResponse(
-                status_code=413,
-                content={
-                    "error": "upload_too_large",
-                    "max_bytes": MAX_UPLOAD_BYTES,
-                    "received": cl_value,
-                },
-            )
-
         if not file.filename or not file.filename.lower().endswith(".xapk"):
             raise HTTPException(status_code=400, detail="A .xapk file is required.")
 
