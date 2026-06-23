@@ -102,8 +102,11 @@ class _UploadSizeGuard:
             return
 
         cl_value: int = -1
+        # HTTP header names are case-insensitive. ASGI 3.0 says names MUST be
+        # lowercase, but we lowercase defensively so an upstream proxy that
+        # forwards ``Content-Length`` mixed-case still triggers our 413.
         for k, v in scope["headers"]:
-            if k == b"content-length":
+            if k.lower() == b"content-length":
                 try:
                     cl_value = int(v.decode("ascii"))
                 except (UnicodeDecodeError, ValueError):
