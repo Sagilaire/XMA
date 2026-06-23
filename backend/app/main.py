@@ -19,6 +19,7 @@ from typing import Optional
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
+from starlette.formparsers import MultiPartParser
 from starlette.responses import Response
 
 from .xapk_processor import cleanup, clone_xapk
@@ -36,6 +37,17 @@ logger = logging.getLogger("xapk.api")
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(3 * 1024 * 1024 * 1024)))
 TEMP_DIR = Path(os.environ.get("TEMP_DIR", "/temp/workflows"))
 TOOLS_DIR = Path(os.environ.get("TOOLS_DIR", "/tools"))
+
+# Starlette's MultiPartParser defaults to ``max_part_size = 1 MiB``. Real-world
+# XAPK files blow past that, so the parser raises during parameter resolution
+# (BEFORE the /upload handler body executes, OUTSIDE our try/except) and the
+# exception escapes to Starlette's default 500 response — a 21-byte
+# ``text/plain`` ``"Internal Server Error\\n"``. We lift the cap to
+# MAX_UPLOAD_BYTES at import time so the parser swallows anything under our
+# global ceiling. Anything over the ceiling is still rejected up-front by the
+# Content-Length guard inside the /upload handler before the parser even
+# runs.
+MultiPartParser.max_part_size = MAX_UPLOAD_BYTES
 
 
 # --- App factory --------------------------------------------------------------------
