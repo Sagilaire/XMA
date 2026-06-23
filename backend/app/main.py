@@ -113,9 +113,16 @@ def create_app() -> FastAPI:
             logger.warning(
                 "Rejecting oversize upload: content_length=%d > max=%d", cl_value, MAX_UPLOAD_BYTES
             )
-            raise HTTPException(
+            # Return a flat-shape JSON response directly instead of raising
+            # HTTPException(detail=dict): the global exception_handler at the
+            # bottom of create_app wraps ``exc.detail`` into ``{"error": ...}``,
+            # which would produce ``{"error": {"error": ...}}`` — the SPA then
+            # renders ``[object Object]`` in its status banner. Returning
+            # JSONResponse keeps the shape the SPA's ``data.error`` lookup
+            # already understands.
+            return JSONResponse(
                 status_code=413,
-                detail={
+                content={
                     "error": "upload_too_large",
                     "max_bytes": MAX_UPLOAD_BYTES,
                     "received": cl_value,
