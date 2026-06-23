@@ -64,6 +64,7 @@ TOOLS_DIR = Path(os.environ.get("TOOLS_DIR", "/tools"))
 # Capture the original ``__init__`` BEFORE we rebind
 # ``MultiPartParser.__init__`` below; the inspect call below needs the
 # authentic signature, not the patched one.
+
 _original_multipart_init = MultiPartParser.__init__
 
 
@@ -89,6 +90,16 @@ except (TypeError, ValueError):
     # to the original 21-byte Starlette 500, which is strictly better than
     # a silent per-request 400.
     _mp_sig_params = set()
+
+# Surface what we actually injected, once per process start. Operators can
+# tell from the container logs whether the widening took effect in this
+# build (``["max_part_size", "max_file_size"]`` on modern Starlette,
+# ``["max_part_size"]`` on the 0.0.17 we pin). Empty list on inspect
+# failure, which is the documented degrade-to-500 path.
+logger.info(
+    "MultiPartParser widening: injecting caps for kwargs=%s",
+    sorted(_mp_sig_params),
+)
 
 
 @wraps(_original_multipart_init)
