@@ -1,0 +1,51 @@
+services:
+  backend:
+    container_name: xapk-backend
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: xapk-multi-account-backend:latest
+    restart: unless-stopped
+    environment:
+      - TOOLS_DIR=/tools
+      - TEMP_DIR=/temp/workflows
+      - LOG_LEVEL=INFO
+      - MAX_UPLOAD_BYTES=3221225472  # 3 GiB
+    ports:
+      - "4015:4015"
+    volumes:
+      # Persistent storage for apktool.jar, build-tools, debug.keystore.
+      - xapk_tools:/tools
+      # Ephemeral per-request scratch space.
+      - xapk_temp:/temp
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:4015/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  frontend:
+    container_name: xapk-frontend
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Override at deploy time with --build-arg, e.g.
+        #   docker compose build --build-arg VITE_API_BASE_URL=https://example.com/api
+        # When unset, the in-app API base is http://localhost:4015.
+        - VITE_API_BASE_URL=${VITE_API_BASE_URL:-http://localhost:4015}
+    image: xapk-multi-account-frontend:latest
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "3015:3015"
+    # No persistent volume needed — Nginx just serves static files.
+
+volumes:
+  xapk_tools:
+    name: xapk_tools
+  xapk_temp:
+    name: xapk_temp

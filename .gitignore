@@ -1,0 +1,63 @@
+# ---- Python (backend) ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.log
+
+# ---- Node / React / Vite (frontend) ----
+node_modules/
+dist/
+.vite/
+*.local
+.cache/
+
+# ---- Env / secrets (keep the example file) ----
+.env
+.env.*
+!.env.example
+!.env.defaults
+
+# ---- Docker / Compose overrides ----
+docker-compose.override.yml
+docker-compose.override.yaml
+*.override.yml
+*.override.yaml
+
+# ---- Build artefacts produced locally (apksigner output, etc.) ----
+*.apk
+!frontend/**/*.apk
+*.ap_
+*.aab
+*.xapk
+*.keystore
+*.jks
+
+# ---- IDE / editor ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ---- OS noise ----
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+$RECYCLE.BIN/
+
+# ---- Misc ----
+.tmp/
+.temp/
+*.tgz
+*.tar.gz
