@@ -16,11 +16,9 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
 from starlette.responses import Response
 
 from .xapk_processor import cleanup, clone_xapk
@@ -38,39 +36,6 @@ logger = logging.getLogger("xapk.api")
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(3 * 1024 * 1024 * 1024)))
 TEMP_DIR = Path(os.environ.get("TEMP_DIR", "/temp/workflows"))
 TOOLS_DIR = Path(os.environ.get("TOOLS_DIR", "/tools"))
-
-
-# --- Custom middleware to enforce upload limit -------------------------------------
-
-
-class UploadSizeLimitMiddleware(BaseHTTPMiddleware):
-    """Reject requests whose Content-Length exceeds the configured limit.
-
-    Starlette's default multipart parser has an internal limit (StreamReader
-    consumes a lot of memory for huge requests), so we abort early using the
-    Content-Length header for known oversize payloads. We also enforce a
-    chunk-size cap so the form parser can't be abused.
-    """
-
-    def __init__(self, app, max_bytes: int) -> None:
-        super().__init__(app)
-        self.max_bytes = max_bytes
-
-    async def dispatch(self, request: Request, call_next) -> Response:
-        if request.url.path == "/upload" and request.method == "POST":
-            cl = request.headers.get("content-length")
-            if cl and cl.isdigit() and int(cl) > self.max_bytes:
-                return JSONResponse(
-                    {
-                        "error": "upload_too_large",
-                        "max_bytes": self.max_bytes,
-                        "received": int(cl),
-                    },
-                    status_code=413,
-                )
-            # Cap the streaming chunk size so python-multipart cannot exhaust memory.
-            request._body_max_size = self.max_bytes  # type: ignore[attr-defined]
-        return await call_next(request)
 
 
 # --- App factory --------------------------------------------------------------------
@@ -93,8 +58,6 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
         expose_headers=["Content-Disposition"],
     )
-
-    app.add_middleware(UploadSizeLimitMiddleware, max_bytes=MAX_UPLOAD_BYTES)
 
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
     TOOLS_DIR.mkdir(parents=True, exist_ok=True)
@@ -127,12 +90,38 @@ def create_app() -> FastAPI:
 
     @app.post("/upload")
     async def upload(
+        request: Request,
         file: UploadFile = File(..., description="Source .xapk archive"),
         suffix: str = Form(..., description="Suffix appended to the package name, e.g. _clone1"),
         new_name: Optional[str] = Form(None, description="Optional new visible app label"),
         new_icon: Optional[UploadFile] = File(None, description="Optional PNG icon"),
     ) -> Response:
-        """Clone a XAPK file inside a workdir and return the result."""
+        """Clone a XAPK file inside a workdir and return the result.
+
+        Important: we deliberately do NOT use Starlette's ``BaseHTTPMiddleware``
+        to enforce ``MAX_UPLOAD_BYTES`` because it forces a full-body read into
+        memory before the handler runs, breaking the multipart streaming flow
+        and dropping the connection mid-upload (the browser then reports
+        "Network error — could not reach the backend" as soon as the first
+        ``xhr.onerror`` fires). Instead we read the Content-Length header here,
+        before any File/Form parameter is materialised; the body bytes flow
+        straight from the socket into ``UploadFile.read`` chunks.
+        """
+        cl_header = request.headers.get("content-length")
+        if cl_header and cl_header.isdigit() and int(cl_header) > MAX_UPLOAD_BYTES:
+            cl_value = int(cl_header)
+            logger.warning(
+                "Rejecting oversize upload: content_length=%d > max=%d", cl_value, MAX_UPLOAD_BYTES
+            )
+            raise HTTPException(
+                status_code=413,
+                detail={
+                    "error": "upload_too_large",
+                    "max_bytes": MAX_UPLOAD_BYTES,
+                    "received": cl_value,
+                },
+            )
+
         if not file.filename or not file.filename.lower().endswith(".xapk"):
             raise HTTPException(status_code=400, detail="A .xapk file is required.")
 
