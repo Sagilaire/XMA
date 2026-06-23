@@ -21,6 +21,7 @@ from typing import Optional
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
+from starlette.background import BackgroundTask
 from starlette.formparsers import MultiPartParser
 from starlette.responses import Response
 
@@ -194,7 +195,15 @@ def create_app() -> FastAPI:
             "debug_keystore_present": bool(paths.get("debug_keystore")),
             "tools_dir": str(TOOLS_DIR),
             "temp_dir": str(TEMP_DIR),
-        }
+        }        # Synchronous workdir cleanup that swallows exceptions (logged).
+        # Used both as a Starlette BackgroundTask after a successful response
+        # is fully streamed, and synchronously inside every except clause
+        # where no response object is yet available to attach a task to.
+        def _safe_cleanup_workdir(work_root: Path) -> None:
+            try:
+                cleanup(work_root)
+            except Exception:  # noqa: BLE001
+                logger.exception("Cleanup of work directory failed")
 
     @app.post("/upload")
     async def upload(
@@ -272,6 +281,11 @@ def create_app() -> FastAPI:
                 result.bytes_written,
             )
 
+            # CRITICAL: cleanup is attached as a BackgroundTask so the workdir
+            # is removed AFTER Starlette's FileResponse has streamed the clone
+            # to the client. If we ran cleanup in a `finally` block, Python
+            # would execute the cleanup BEFORE the response was sent, deleting
+            # cloned.xapk before FileResponse.__call__ could os.stat() it.
             return FileResponse(
                 path=str(result.output_path),
                 media_type="application/octet-stream",
@@ -281,21 +295,23 @@ def create_app() -> FastAPI:
                     "X-New-Package": result.new_package,
                     "X-New-Label": result.new_label,
                 },
+                background=BackgroundTask(_safe_cleanup_workdir, work_root),
             )
 
+        # No `finally:` here — cleanup is delegated either to the
+        # BackgroundTask (success path) or to explicit `_safe_cleanup_workdir`
+        # calls in each except clause (error paths).
         except HTTPException:
+            _safe_cleanup_workdir(work_root)
             raise
         except ValueError as exc:
+            _safe_cleanup_workdir(work_root)
             logger.exception("Bad request")
             raise HTTPException(status_code=400, detail=str(exc))
         except Exception as exc:  # noqa: BLE001
+            _safe_cleanup_workdir(work_root)
             logger.exception("Processing failed")
             raise HTTPException(status_code=500, detail=f"Processing failed: {exc}")
-        finally:
-            try:
-                cleanup(work_root)
-            except Exception:  # noqa: BLE001
-                logger.exception("Cleanup of work directory failed")
 
     @app.exception_handler(HTTPException)
     async def http_exception_handler(_: Request, exc: HTTPException) -> JSONResponse:
