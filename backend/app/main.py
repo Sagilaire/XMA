@@ -61,9 +61,9 @@ TOOLS_DIR = Path(os.environ.get("TOOLS_DIR", "/tools"))
 # during FastAPI's parameter resolution, BEFORE our upload handler body runs,
 # which is why our ``except Exception`` never catches it.
 #
-# The robust cross-version fix is to wrap ``MultiPartParser.__init__`` and
-# inject our cap when callers omit it. ``setdefault`` keeps any caller-supplied
-# value (e.g. unit tests) authoritative.
+# Capture the original ``__init__`` BEFORE we rebind
+# ``MultiPartParser.__init__`` below; the inspect call below needs the
+# authentic signature, not the patched one.
 _original_multipart_init = MultiPartParser.__init__
 
 
@@ -81,10 +81,14 @@ try:
     )
     _mp_sig_params.discard("self")
 except (TypeError, ValueError):
-    # inspect.signature can fail on built-ins / C-impls; fall back to a safe
-    # minimal set that has been supported across every Starlette release we
-    # care about.
-    _mp_sig_params = {"max_part_size"}
+    # inspect.signature can fail on built-ins / C-impls. Default to an EMPTY
+    # set so we don't accidentally inject a kwarg the installed parser does
+    # NOT accept — that would reintroduce the same TypeError we are
+    # patching around. The parser's built-in caps kick in unchanged in that
+    # case; the user-visible failure mode for a too-large upload degrades
+    # to the original 21-byte Starlette 500, which is strictly better than
+    # a silent per-request 400.
+    _mp_sig_params = set()
 
 
 @wraps(_original_multipart_init)
