@@ -273,6 +273,21 @@ html, body, #root {
   margin-top: 8px;
 }
 
+.hint.preview-line {
+  margin: 14px 0 0;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  line-height: 1.45;
+}
+.hint.preview-line code {
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+  background: rgba(91,140,255,0.07);
+  color: var(--accent-hover);
+  padding: 1px 6px;
+  border-radius: 5px;
+  font-size: 0.85rem;
+}
+
 @media (max-width: 600px) {
   .form-grid { grid-template-columns: 1fr; }
   .actions { flex-direction: column; align-items: stretch; }

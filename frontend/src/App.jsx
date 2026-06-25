@@ -11,13 +11,19 @@ const SUFFIX_PATTERN = /^[A-Za-z0-9_]{1,32}$/;
 // not matching SUFFIX_PATTERN, but we sanitise upfront so the user can SEE
 // what the resolved applicationId will be BEFORE uploading.
 //
-// Rules (must stay in sync with backend normative):
-//  * lowercase
+// Rules (must stay in sync with backend is_safe_suffix in utils.py):
+//  * trim + lowercase
 //  * any run of non-[a-z0-9_] becomes a single underscore
 //  * collapse underscores, strip leading/trailing underscores
 //  * prepend `_` so the result always reads as a token *tacked on* to the
 //    original applicationId (e.g. com.ankama.dofustouch + _panda_touch)
 //  * cap at 32 chars so is_safe_suffix is happy
+//
+// Trade-off (deliberate): the regex is ASCII-only. Labels that are entirely
+// non-ASCII (e.g. "日本語") collapse to "" and the auto-derive effect
+// leaves the suffix alone — the user can still type their intended token
+// by hand. Widening this to /\p{L}\p{N}/u would also require the backend
+// is_safe_suffix to widen; out of scope for this fix.
 function sanitizeNewNameToSuffix(name) {
   if (!name) return '';
   let s = name.trim().toLowerCase();
@@ -224,14 +230,24 @@ export default function App() {
 
   // Auto-derive the package suffix from newName unless the user has begun
   // typing directly into the suffix field. Without this, two clones with
-  // different visible labels share the constant `_clone` suffix and
-  // therefore get the same Android applicationId — PackageManager treats
-  // the second install as an UPDATE and replaces the first.
+  // different visible labels share the same applicationId and Android
+  // treats the second install as an UPDATE (replacing the first).
+  //
+  // Recovery rule (review item 4): if the user typed into the suffix input
+  // by accident but later returned it to a value that matches what the
+  // auto-derive would currently produce, clear `suffixManuallyEdited` so
+  // future newName edits re-engage the auto-derive. Avoids locking the
+  // user out from one stray keystroke.
   useEffect(() => {
-    if (suffixManuallyEdited) return;
     const derived = sanitizeNewNameToSuffix(newName);
+    if (suffixManuallyEdited) {
+      if (derived && derived === suffix) {
+        setSuffixManuallyEdited(false);
+      }
+      return;
+    }
     if (derived) setSuffix(derived);
-  }, [newName, suffixManuallyEdited]);
+  }, [newName, suffix, suffixManuallyEdited]);
 
   return (
     <div className="app-shell">
@@ -308,15 +324,15 @@ export default function App() {
           </div>
         </div>
 
-        <p className="hint preview-line">
+        <p className="hint preview-line" aria-live="polite">
           Will install as Android package{' '}
           <code>
-            {`<…original…>${suffix}`}
+            {`<original-pkg>${suffix}`}
           </code>{' '}
-          — the full resolved name appears in the green banner below after upload.
-          Different labels (or two consecutive rounds) produce different
-          applicationIds, so side-by-side installs no longer trigger the
-          “update existing app” prompt.
+          — the full resolved name appears in the green banner below after
+          upload. Different labels (or two consecutive rounds) produce
+          different applicationIds, so side-by-side installs no longer
+          trigger the "update existing app" prompt.
         </p>
 
         <div className="actions">
