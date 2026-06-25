@@ -7,6 +7,28 @@ const API_BASE =
 const APP_NAME = 'XAPK Multi-Account Cloner';
 const SUFFIX_PATTERN = /^[A-Za-z0-9_]{1,32}$/;
 
+// Mirror of backend's package-suffix rules. The backend rejects any string
+// not matching SUFFIX_PATTERN, but we sanitise upfront so the user can SEE
+// what the resolved applicationId will be BEFORE uploading.
+//
+// Rules (must stay in sync with backend normative):
+//  * lowercase
+//  * any run of non-[a-z0-9_] becomes a single underscore
+//  * collapse underscores, strip leading/trailing underscores
+//  * prepend `_` so the result always reads as a token *tacked on* to the
+//    original applicationId (e.g. com.ankama.dofustouch + _panda_touch)
+//  * cap at 32 chars so is_safe_suffix is happy
+function sanitizeNewNameToSuffix(name) {
+  if (!name) return '';
+  let s = name.trim().toLowerCase();
+  s = s.replace(/[^a-z0-9_]+/g, '_');
+  s = s.replace(/_+/g, '_');
+  s = s.replace(/^_+|_+$/g, '');
+  if (!s) return '';
+  if (!s.startsWith('_')) s = '_' + s;
+  return s.slice(0, 32);
+}
+
 function formatBytes(n) {
   if (!Number.isFinite(n) || n <= 0) return '';
   const units = ['B', 'KB', 'MB', 'GB'];
@@ -14,7 +36,7 @@ function formatBytes(n) {
   let v = n;
   while (v >= 1024 && i < units.length - 1) {
     v /= 1024;
-    i++;
+    i += 1;
   }
   return `${v.toFixed(v >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
 }
@@ -28,10 +50,21 @@ function validateIcon(file) {
   return null;
 }
 
+function freshRandomSuffix() {
+  // 4 lowercase alphanumeric chars -> 36^4 ~ 1.7M combinations,
+  // enough entropy that consecutive clones on this SPA almost never
+  // collide on applicationId by accident.
+  return `_${Math.random().toString(36).slice(2, 6)}`;
+}
+
 export default function App() {
   const [xapk, setXapk] = useState(null);
   const [icon, setIcon] = useState(null);
-  const [suffix, setSuffix] = useState('_clone');
+  const [suffix, setSuffix] = useState(freshRandomSuffix);
+  // Becomes true the moment the user types directly into the suffix field.
+  // Suppresses auto-derivation so an explicit edit is never clobbered by a
+  // later change to newName.
+  const [suffixManuallyEdited, setSuffixManuallyEdited] = useState(false);
   const [newName, setNewName] = useState('');
   const [progress, setProgress] = useState(0);
   const [busy, setBusy] = useState(false);
@@ -44,7 +77,12 @@ export default function App() {
     cancelInFlight();
     setXapk(null);
     setIcon(null);
-    setSuffix('_clone');
+    // Fresh random suffix per round — combined with auto-derivation from
+    // newName this guarantees two consecutive uploads always get distinct
+    // Android applicationIds, so the second install never shows the
+    // "do you want to update the existing app?" prompt.
+    setSuffix(freshRandomSuffix());
+    setSuffixManuallyEdited(false);
     setNewName('');
     setProgress(0);
     setBusy(false);
@@ -110,8 +148,6 @@ export default function App() {
         setProgress(Math.round((ev.loaded / ev.total) * 100));
       };
       xhr.upload.onload = () => {
-        // Once the payload is fully uploaded, the server starts processing.
-        // We have no further progress events until the response comes back.
         setIndeterminate(true);
         setProgress(100);
       };
@@ -183,7 +219,19 @@ export default function App() {
     [busy, cancelInFlight, xapk, icon, suffix, newName],
   );
 
+  // Die on unmount: cancel any in-flight upload so we don't leak the XHR.
   useEffect(() => () => cancelInFlight(), [cancelInFlight]);
+
+  // Auto-derive the package suffix from newName unless the user has begun
+  // typing directly into the suffix field. Without this, two clones with
+  // different visible labels share the constant `_clone` suffix and
+  // therefore get the same Android applicationId — PackageManager treats
+  // the second install as an UPDATE and replaces the first.
+  useEffect(() => {
+    if (suffixManuallyEdited) return;
+    const derived = sanitizeNewNameToSuffix(newName);
+    if (derived) setSuffix(derived);
+  }, [newName, suffixManuallyEdited]);
 
   return (
     <div className="app-shell">
@@ -222,8 +270,14 @@ export default function App() {
               className="input"
               type="text"
               value={suffix}
-              onChange={(e) => setSuffix(e.target.value)}
-              placeholder="_clone1"
+              onChange={(e) => {
+                setSuffix(e.target.value);
+                // Once the user types into the suffix edit, treat it as
+                // an authoritative override; stop the auto-derivation from
+                // newName from clobbering it on later renders.
+                setSuffixManuallyEdited(true);
+              }}
+              placeholder="e.g. _panda or _clone_a4f8"
               maxLength={32}
               required
             />
@@ -253,6 +307,17 @@ export default function App() {
             <IconPicker icon={icon} onIcon={onPickIcon} />
           </div>
         </div>
+
+        <p className="hint preview-line">
+          Will install as Android package{' '}
+          <code>
+            {`<…original…>${suffix}`}
+          </code>{' '}
+          — the full resolved name appears in the green banner below after upload.
+          Different labels (or two consecutive rounds) produce different
+          applicationIds, so side-by-side installs no longer trigger the
+          “update existing app” prompt.
+        </p>
 
         <div className="actions">
           <div className={`progress${indeterminate ? ' indeterminate' : ''}`}>
